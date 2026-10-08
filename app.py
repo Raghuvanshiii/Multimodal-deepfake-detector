@@ -21,7 +21,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Replace with your actual GitHub Release download link
 WEIGHTS_URL = "https://github.com/<your-username>/<your-repo>/releases/download/v1.0/best_deepfake_detector.pt"
 LOCAL_WEIGHTS_PATH = "best_deepfake_detector.pt"
 device = torch.device("cpu")
@@ -33,7 +32,6 @@ with st.sidebar:
     st.divider()
     threshold = st.slider("Classification Threshold (Fake %)", 10, 90, 50, step=5) / 100.0
 
-# Apply custom theme variables according to the user selection
 if theme_choice == "Dark Mode":
     st.markdown("""
         <style>
@@ -132,7 +130,7 @@ def load_models():
 
 model, mtcnn = load_models()
 
-# Sidebar Metadata Cards
+# Sidebar Metadata
 with st.sidebar:
     st.subheader("Model Specifications")
     st.markdown("- **Visual Stream:** MTCNN + ResNet-18")
@@ -144,12 +142,84 @@ with st.sidebar:
 st.title("🛡️ Multimodal Deepfake Forensic Analyzer")
 st.caption("Cross-modal temporal synthesis verification using ResNet spatial embeddings and Mel-frequency acoustic alignment.")
 
-# ----------------- File Input & Two-Column Layout -----------------
-uploaded_file = st.file_uploader("Upload MP4 Video for Forensic Evaluation", type=["mp4"])
+# ----------------- Input Mode Selection -----------------
+input_mode = st.radio("Select Input Source:", ["📁 Upload MP4 File", "📹 Live System Camera Recording"], horizontal=True)
 
-if uploaded_file is not None:
+video_bytes = None
+
+if input_mode == "📁 Upload MP4 File":
+    uploaded_file = st.file_uploader("Upload an MP4 Video for Forensic Evaluation", type=["mp4"])
+    if uploaded_file is not None:
+        video_bytes = uploaded_file.read()
+
+else:
+    st.info("Record a short 3–10 second clip using your device camera and microphone. Click Start to record and Stop when finished.")
+    
+    # HTML5/JS In-Browser Camera & Audio Recorder
+    camera_html = """
+    <div style="border: 1px solid rgba(128,128,128,0.3); border-radius: 10px; padding: 15px; text-align: center;">
+        <video id="livePreview" width="360" height="240" autoplay muted style="border-radius: 8px; background: #000;"></video><br><br>
+        <button id="startBtn" style="padding: 8px 16px; margin: 4px; border-radius: 6px; cursor: pointer;">🔴 Start Recording</button>
+        <button id="stopBtn" disabled style="padding: 8px 16px; margin: 4px; border-radius: 6px; cursor: pointer;">⏹️ Stop & Save</button>
+        <p id="statusMsg" style="font-size: 13px; color: gray; margin-top: 8px;">Camera inactive</p>
+        <a id="downloadLink" style="display:none; margin-top: 8px; font-weight: bold; color: #ff4b4b;">⬇️ Download Recorded Clip (.mp4/.webm)</a>
+    </div>
+
+    <script>
+    let mediaRecorder;
+    let recordedChunks = [];
+    const preview = document.getElementById('livePreview');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusMsg = document.getElementById('statusMsg');
+    const downloadLink = document.getElementById('downloadLink');
+
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        .then(stream => {
+            preview.srcObject = stream;
+            statusMsg.innerText = "Camera ready. Click Start Recording.";
+
+            startBtn.onclick = () => {
+                recordedChunks = [];
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
+                mediaRecorder.onstop = () => {
+                    const blob = new Blob(recordedChunks, { type: 'video/mp4' });
+                    const url = URL.createObjectURL(blob);
+                    downloadLink.href = url;
+                    downloadLink.download = "camera_recording.mp4";
+                    downloadLink.style.display = "inline-block";
+                    downloadLink.innerText = "Click to Download & Upload above";
+                    statusMsg.innerText = "Recording finished! Download and upload it to analyze.";
+                };
+                mediaRecorder.start();
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusMsg.innerText = "Recording in progress...";
+            };
+
+            stopBtn.onclick = () => {
+                mediaRecorder.stop();
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            };
+        })
+        .catch(err => {
+            statusMsg.innerText = "Camera access denied or unavailable: " + err;
+        });
+    </script>
+    """
+    st.components.v1.html(camera_html, height=360)
+    
+    # Secondary uploader for the captured camera clip
+    captured_upload = st.file_uploader("Upload Your Recorded Camera Clip", type=["mp4", "webm"], key="cam_upload")
+    if captured_upload is not None:
+        video_bytes = captured_upload.read()
+
+# ----------------- Processing & Inference Pipeline -----------------
+if video_bytes is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
-        tfile.write(uploaded_file.read())
+        tfile.write(video_bytes)
         video_path = tfile.name
 
     col_left, col_right = st.columns([1, 1], gap="medium")
@@ -185,7 +255,6 @@ if uploaded_file is not None:
                 face = mtcnn(pil_img)
                 if face is not None:
                     face_tensors.append(face)
-                    # Denormalize tensor for visual preview
                     preview_img = (face.permute(1, 2, 0).cpu().numpy() * 127.5 + 127.5).astype(np.uint8)
                     preview_faces.append(preview_img)
                 else:
@@ -200,7 +269,10 @@ if uploaded_file is not None:
         log_mel_data = None
         try:
             y, _ = librosa.load(video_path, sr=16000)
-            y = np.pad(y, (0, 160000 - len(y))) if len(y) < 160000 else y[:160000]
+            if len(y) < 160000:
+                y = np.pad(y, (0, 160000 - len(y)))
+            else:
+                y = y[:160000]
             mel = librosa.feature.melspectrogram(y=y, sr=16000, n_mels=128, n_fft=2048, hop_length=512)
             log_mel = librosa.power_to_db(mel, ref=np.max)
             log_mel = (log_mel - log_mel.min()) / (log_mel.max() - log_mel.min() + 1e-6)
@@ -218,7 +290,7 @@ if uploaded_file is not None:
         real_prob = 1.0 - fake_prob
         progress_bar.progress(100, text="Analysis complete!")
 
-        # --- Step 4: Verdict & Confidence Cards ---
+        # --- Step 4: Results Display ---
         with col_right:
             is_fake = fake_prob >= threshold
             
@@ -227,17 +299,15 @@ if uploaded_file is not None:
             else:
                 st.success("### ✅ Verdict: AUTHENTIC (Real)")
 
-            # Metric Cards
             m1, m2 = st.columns(2)
             m1.metric("Deepfake Probability", f"{fake_prob * 100:.2f}%")
             m2.metric("Authentic Confidence", f"{real_prob * 100:.2f}%")
 
-            # Dual Distribution Bars
             st.write("**Confidence Breakdown:**")
             st.progress(fake_prob, text=f"Deepfake Risk: {fake_prob * 100:.1f}%")
             st.progress(real_prob, text=f"Authenticity Score: {real_prob * 100:.1f}%")
 
-        # --- Step 5: Visual Explainability Tabs ---
+        # --- Step 5: Explainability Tabs ---
         st.divider()
         tab1, tab2 = st.tabs(["🖼️ Extracted Facial Frames (MTCNN)", "🎵 Acoustic Spectrogram (Librosa)"])
 
