@@ -1,6 +1,7 @@
 import os
 import cv2
 import tempfile
+import urllib.request
 import numpy as np
 from PIL import Image
 import librosa
@@ -11,15 +12,22 @@ import torch.nn as nn
 import torchvision.models as models
 from facenet_pytorch import MTCNN
 
-st.set_page_config(page_title="Multimodal Deepfake Detector", layout="centered")
-
-st.title("Multimodal Deepfake Detection System")
-st.write("Upload an MP4 video to evaluate spatial-temporal facial coherence and audio-visual synchrony.")
+# ----------------- Configuration & Paths -----------------
+# Replace this URL with your exact GitHub Release download link
+WEIGHTS_URL = "https://github.com/Raghuvanshiii/Multimodal-deepfake-detector/releases/download/v1.0/best_deepfake_detector.pt"
+LOCAL_WEIGHTS_PATH = "best_deepfake_detector.pt"
 
 device = torch.device("cpu")
 
-# --- 1. Architecture Definitions ---
+st.set_page_config(
+    page_title="Multimodal Deepfake Detector",
+    page_icon="🛡️",
+    layout="centered"
+)
+
+# ----------------- Model Architecture -----------------
 class AudioCNN(nn.Module):
+    """Extracts high-level spectral features from a Log-Mel Spectrogram."""
     def __init__(self, embed_dim=512):
         super(AudioCNN, self).__init__()
         self.conv = nn.Sequential(
@@ -42,19 +50,31 @@ class AudioCNN(nn.Module):
         feat = self.conv(x)
         return self.fc(feat.view(feat.size(0), -1))
 
+
 class MultimodalDeepfakeDetector(nn.Module):
+    """Unified framework fusing spatial ResNet embeddings, audio CNN, and temporal self-attention."""
     def __init__(self, embed_dim=512, nhead=4, num_transformer_layers=2):
         super(MultimodalDeepfakeDetector, self).__init__()
+        
+        # Spatial backbone
         resnet = models.resnet18(weights=None)
         self.visual_backbone = nn.Sequential(*list(resnet.children())[:-1])
         self.visual_proj = nn.Linear(512, embed_dim)
+        
+        # Audio backbone
         self.audio_backbone = AudioCNN(embed_dim=embed_dim)
         
+        # Temporal attention
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=nhead, dim_feedforward=1024, dropout=0.2, batch_first=True
+            d_model=embed_dim,
+            nhead=nhead,
+            dim_feedforward=1024,
+            dropout=0.2,
+            batch_first=True
         )
         self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
         
+        # Multimodal fusion classifier
         self.classifier = nn.Sequential(
             nn.Linear(embed_dim * 2, 256),
             nn.ReLU(),
@@ -63,8 +83,10 @@ class MultimodalDeepfakeDetector(nn.Module):
         )
 
     def forward(self, faces, spectrogram):
+        # faces: [B, T, C, H, W]
         b, t, c, h, w = faces.shape
-        vis = self.visual_backbone(faces.view(b * t, c, h, w)).view(b * t, -1)
+        faces_reshaped = faces.view(b * t, c, h, w)
+        vis = self.visual_backbone(faces_reshaped).view(b * t, -1)
         vis = self.visual_proj(vis).view(b, t, -1)
         
         temp_out = self.temporal_transformer(vis)
@@ -74,36 +96,58 @@ class MultimodalDeepfakeDetector(nn.Module):
         fused = torch.cat((video_repr, audio_repr), dim=1)
         return self.classifier(fused).squeeze(1)
 
-# --- 2. Load Checkpoint and Face Detector ---
-@st.cache_resource
+
+# ----------------- Resource Initialization (Cached) -----------------
+@st.cache_resource(show_spinner=False)
 def load_models():
+    # 1. Download weights from GitHub Release if not present locally
+    if not os.path.exists(LOCAL_WEIGHTS_PATH):
+        with st.spinner("Downloading trained model weights from GitHub Release..."):
+            urllib.request.urlretrieve(WEIGHTS_URL, LOCAL_WEIGHTS_PATH)
+
+    # 2. Instantiate and load weights onto CPU
     detector_model = MultimodalDeepfakeDetector().to(device)
-    checkpoint_file = "best_deepfake_detector.pt"
-    if os.path.exists(checkpoint_file):
-        weights = torch.load(checkpoint_file, map_location=device, weights_only=True)
-        cleaned_weights = {k.replace("module.", ""): v for k, v in weights.items()}
-        detector_model.load_state_dict(cleaned_weights)
+    raw_weights = torch.load(LOCAL_WEIGHTS_PATH, map_location=device, weights_only=True)
+    cleaned_weights = {k.replace("module.", ""): v for k, v in raw_weights.items()}
+    detector_model.load_state_dict(cleaned_weights)
     detector_model.eval()
-    
+
+    # 3. Initialize MTCNN face detector
     face_detector = MTCNN(
-        image_size=224, margin=20, keep_all=False, select_largest=True, post_process=True, device=device
+        image_size=224,
+        margin=20,
+        keep_all=False,
+        select_largest=True,
+        post_process=True,
+        device=device
     )
     return detector_model, face_detector
 
 model, mtcnn = load_models()
 
-# --- 3. UI and Video Processing ---
-uploaded_file = st.file_uploader("Choose a video file (.mp4)", type=["mp4"])
+# ----------------- Web UI -----------------
+st.title("🛡️ Multimodal Deepfake Detection System")
+st.markdown(
+    """
+    This system examines audio-visual artifacts across video streams by coupling:
+    - **Spatial facial extraction** (MTCNN + ResNet-18)
+    - **Temporal sequence analysis** (Multi-Head Self-Attention Transformer)
+    - **Acoustic synchronization** (Mel-Spectrogram 2D CNN)
+    """
+)
+
+uploaded_file = st.file_uploader("Upload an MP4 Video to Analyze", type=["mp4"])
 
 if uploaded_file is not None:
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tfile.write(uploaded_file.read())
-    video_path = tfile.name
+    # Save uploaded file temporarily for OpenCV and Librosa processing
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+        tfile.write(uploaded_file.read())
+        video_path = tfile.name
 
     st.video(video_path)
 
-    with st.spinner("Processing facial temporal dynamics and audio spectrogram..."):
-        # Visual Processing: Extract 16 frames
+    with st.spinner("Analyzing spatial-temporal facial coherence and audio track..."):
+        # --- 1. Visual Stream Extraction ---
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         indices = np.linspace(0, max(total_frames - 1, 0), 16, dtype=int)
@@ -124,10 +168,13 @@ if uploaded_file is not None:
         cap.release()
         faces_tensor = torch.stack(face_tensors[:16]).unsqueeze(0).to(device)
 
-        # Audio Processing: Extract Log-Mel Spectrogram
+        # --- 2. Audio Stream Extraction ---
         try:
             y, _ = librosa.load(video_path, sr=16000)
-            y = np.pad(y, (0, 160000 - len(y))) if len(y) < 160000 else y[:160000]
+            if len(y) < 160000:
+                y = np.pad(y, (0, 160000 - len(y)))
+            else:
+                y = y[:160000]
             mel = librosa.feature.melspectrogram(y=y, sr=16000, n_mels=128, n_fft=2048, hop_length=512)
             log_mel = librosa.power_to_db(mel, ref=np.max)
             log_mel = (log_mel - log_mel.min()) / (log_mel.max() - log_mel.min() + 1e-6)
@@ -135,18 +182,20 @@ if uploaded_file is not None:
         except Exception:
             audio_tensor = torch.zeros(1, 1, 128, 313).to(device)
 
-        # Model Inference
+        # --- 3. Forward Pass ---
         with torch.no_grad():
             logit = model(faces_tensor, audio_tensor)
             fake_prob = float(torch.sigmoid(logit).item())
 
         real_prob = 1.0 - fake_prob
 
-    # --- 4. Render Output ---
+    # --- 4. Render Verdict ---
     st.divider()
     if fake_prob >= 0.5:
-        st.error(f"Verdict: **DEEPFAKE (Manipulated)** — Confidence: {fake_prob * 100:.2f}%")
+        st.error(f"### Verdict: DEEPFAKE (Manipulated)")
+        st.markdown(f"**Confidence Score:** `{fake_prob * 100:.2f}%`")
     else:
-        st.success(f"Verdict: **AUTHENTIC (Real)** — Confidence: {real_prob * 100:.2f}%")
+        st.success(f"### Verdict: AUTHENTIC (Real)")
+        st.markdown(f"**Confidence Score:** `{real_prob * 100:.2f}%`")
 
-    st.progress(fake_prob, text=f"Deepfake Probability Score: {fake_prob * 100:.1f}%")
+    st.progress(fake_prob, text=f"Deepfake Probability: {fake_prob * 100:.1f}%")
