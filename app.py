@@ -1,0 +1,152 @@
+import os
+import cv2
+import tempfile
+import numpy as np
+from PIL import Image
+import librosa
+import streamlit as st
+
+import torch
+import torch.nn as nn
+import torchvision.models as models
+from facenet_pytorch import MTCNN
+
+st.set_page_config(page_title="Multimodal Deepfake Detector", layout="centered")
+
+st.title("Multimodal Deepfake Detection System")
+st.write("Upload an MP4 video to evaluate spatial-temporal facial coherence and audio-visual synchrony.")
+
+device = torch.device("cpu")
+
+# --- 1. Architecture Definitions ---
+class AudioCNN(nn.Module):
+    def __init__(self, embed_dim=512):
+        super(AudioCNN, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.fc = nn.Linear(128, embed_dim)
+
+    def forward(self, x):
+        feat = self.conv(x)
+        return self.fc(feat.view(feat.size(0), -1))
+
+class MultimodalDeepfakeDetector(nn.Module):
+    def __init__(self, embed_dim=512, nhead=4, num_transformer_layers=2):
+        super(MultimodalDeepfakeDetector, self).__init__()
+        resnet = models.resnet18(weights=None)
+        self.visual_backbone = nn.Sequential(*list(resnet.children())[:-1])
+        self.visual_proj = nn.Linear(512, embed_dim)
+        self.audio_backbone = AudioCNN(embed_dim=embed_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=nhead, dim_feedforward=1024, dropout=0.2, batch_first=True
+        )
+        self.temporal_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, faces, spectrogram):
+        b, t, c, h, w = faces.shape
+        vis = self.visual_backbone(faces.view(b * t, c, h, w)).view(b * t, -1)
+        vis = self.visual_proj(vis).view(b, t, -1)
+        
+        temp_out = self.temporal_transformer(vis)
+        video_repr = temp_out.mean(dim=1)
+        audio_repr = self.audio_backbone(spectrogram)
+        
+        fused = torch.cat((video_repr, audio_repr), dim=1)
+        return self.classifier(fused).squeeze(1)
+
+# --- 2. Load Checkpoint and Face Detector ---
+@st.cache_resource
+def load_models():
+    detector_model = MultimodalDeepfakeDetector().to(device)
+    checkpoint_file = "best_deepfake_detector.pt"
+    if os.path.exists(checkpoint_file):
+        weights = torch.load(checkpoint_file, map_location=device, weights_only=True)
+        cleaned_weights = {k.replace("module.", ""): v for k, v in weights.items()}
+        detector_model.load_state_dict(cleaned_weights)
+    detector_model.eval()
+    
+    face_detector = MTCNN(
+        image_size=224, margin=20, keep_all=False, select_largest=True, post_process=True, device=device
+    )
+    return detector_model, face_detector
+
+model, mtcnn = load_models()
+
+# --- 3. UI and Video Processing ---
+uploaded_file = st.file_uploader("Choose a video file (.mp4)", type=["mp4"])
+
+if uploaded_file is not None:
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tfile.write(uploaded_file.read())
+    video_path = tfile.name
+
+    st.video(video_path)
+
+    with st.spinner("Processing facial temporal dynamics and audio spectrogram..."):
+        # Visual Processing: Extract 16 frames
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        indices = np.linspace(0, max(total_frames - 1, 0), 16, dtype=int)
+        face_tensors = []
+
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                face_tensors.append(torch.zeros(3, 224, 224))
+                continue
+            pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            try:
+                face = mtcnn(pil_img)
+                face_tensors.append(face if face is not None else torch.zeros(3, 224, 224))
+            except Exception:
+                face_tensors.append(torch.zeros(3, 224, 224))
+        cap.release()
+        faces_tensor = torch.stack(face_tensors[:16]).unsqueeze(0).to(device)
+
+        # Audio Processing: Extract Log-Mel Spectrogram
+        try:
+            y, _ = librosa.load(video_path, sr=16000)
+            y = np.pad(y, (0, 160000 - len(y))) if len(y) < 160000 else y[:160000]
+            mel = librosa.feature.melspectrogram(y=y, sr=16000, n_mels=128, n_fft=2048, hop_length=512)
+            log_mel = librosa.power_to_db(mel, ref=np.max)
+            log_mel = (log_mel - log_mel.min()) / (log_mel.max() - log_mel.min() + 1e-6)
+            audio_tensor = torch.tensor(log_mel, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+        except Exception:
+            audio_tensor = torch.zeros(1, 1, 128, 313).to(device)
+
+        # Model Inference
+        with torch.no_grad():
+            logit = model(faces_tensor, audio_tensor)
+            fake_prob = float(torch.sigmoid(logit).item())
+
+        real_prob = 1.0 - fake_prob
+
+    # --- 4. Render Output ---
+    st.divider()
+    if fake_prob >= 0.5:
+        st.error(f"Verdict: **DEEPFAKE (Manipulated)** — Confidence: {fake_prob * 100:.2f}%")
+    else:
+        st.success(f"Verdict: **AUTHENTIC (Real)** — Confidence: {real_prob * 100:.2f}%")
+
+    st.progress(fake_prob, text=f"Deepfake Probability Score: {fake_prob * 100:.1f}%")
