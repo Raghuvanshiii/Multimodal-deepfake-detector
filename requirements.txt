@@ -1,0 +1,9 @@
+streamlit
+torch
+torchvision
+facenet-pytorch
+librosa
+soundfile
+numpy
+Pillow
+opencv-python-headless
