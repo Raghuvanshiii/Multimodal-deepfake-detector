@@ -7,3 +7,4 @@ soundfile
 numpy
 Pillow
 opencv-python-headless
+matplotlib
