@@ -1,7 +1,7 @@
 import os
 import cv2
 import tempfile
-import urllib.request
+import requests
 import numpy as np
 from PIL import Image
 import librosa
@@ -21,7 +21,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-WEIGHTS_URL = "https://github.com/<your-username>/<your-repo>/releases/download/v1.0/best_deepfake_detector.pt"
+# Configurable Weights URL (configured to your GitHub repository)
+DEFAULT_WEIGHTS_URL = (
+    "https://github.com/Raghuvanshiii/multimodal-deepfake-detector/releases/download/v1.0/best_deepfake_detector.pt"
+)
+WEIGHTS_URL = os.getenv("WEIGHTS_URL", DEFAULT_WEIGHTS_URL)
 LOCAL_WEIGHTS_PATH = "best_deepfake_detector.pt"
 device = torch.device("cpu")
 
@@ -113,14 +117,51 @@ class MultimodalDeepfakeDetector(nn.Module):
 # ----------------- Resource Initialization (Cached) -----------------
 @st.cache_resource(show_spinner=False)
 def load_models():
-    if not os.path.exists(LOCAL_WEIGHTS_PATH):
-        with st.spinner("Downloading trained model weights from GitHub Release..."):
-            urllib.request.urlretrieve(WEIGHTS_URL, LOCAL_WEIGHTS_PATH)
-
     detector_model = MultimodalDeepfakeDetector().to(device)
-    raw_weights = torch.load(LOCAL_WEIGHTS_PATH, map_location=device, weights_only=True)
-    cleaned_weights = {k.replace("module.", ""): v for k, v in raw_weights.items()}
-    detector_model.load_state_dict(cleaned_weights)
+    weights_loaded = False
+
+    # Download only if file is missing or corrupted/empty (< 1MB)
+    if not os.path.exists(LOCAL_WEIGHTS_PATH) or os.path.getsize(LOCAL_WEIGHTS_PATH) < 1024 * 1024:
+        try:
+            with st.spinner("Checking and downloading trained model weights..."):
+                headers = {"User-Agent": "Mozilla/5.0"}
+                resp = requests.get(WEIGHTS_URL, stream=True, headers=headers, timeout=60)
+                
+                if resp.status_code == 200:
+                    with open(LOCAL_WEIGHTS_PATH, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=16384):
+                            if chunk:
+                                f.write(chunk)
+                    weights_loaded = True
+                else:
+                    if os.path.exists(LOCAL_WEIGHTS_PATH):
+                        os.remove(LOCAL_WEIGHTS_PATH)
+                    st.warning(
+                        f"⚠️ Model checkpoint not found at release URL (HTTP {resp.status_code}). "
+                        "Starting with baseline architecture for demonstration. "
+                        "Upload 'best_deepfake_detector.pt' to a public GitHub Release to enable trained inference."
+                    )
+        except Exception as e:
+            if os.path.exists(LOCAL_WEIGHTS_PATH):
+                os.remove(LOCAL_WEIGHTS_PATH)
+            st.warning(f"⚠️ Could not download weights ({e}). Running in demonstration mode.")
+    else:
+        weights_loaded = True
+
+    if weights_loaded and os.path.exists(LOCAL_WEIGHTS_PATH):
+        try:
+            raw_weights = torch.load(LOCAL_WEIGHTS_PATH, map_location=device, weights_only=True)
+            if isinstance(raw_weights, dict):
+                if "state_dict" in raw_weights:
+                    raw_weights = raw_weights["state_dict"]
+                elif "model_state_dict" in raw_weights:
+                    raw_weights = raw_weights["model_state_dict"]
+                cleaned_weights = {k.replace("module.", ""): v for k, v in raw_weights.items()}
+                detector_model.load_state_dict(cleaned_weights, strict=False)
+            st.sidebar.success("✅ Pretrained weights loaded")
+        except Exception as err:
+            st.sidebar.warning(f"⚠️ Checkpoint load issue: {err}")
+
     detector_model.eval()
 
     face_detector = MTCNN(
@@ -155,7 +196,6 @@ if input_mode == "📁 Upload MP4 File":
 else:
     st.info("Record a short 3–10 second clip using your device camera and microphone. Click Start to record and Stop when finished.")
     
-    # HTML5/JS In-Browser Camera & Audio Recorder
     camera_html = """
     <div style="border: 1px solid rgba(128,128,128,0.3); border-radius: 10px; padding: 15px; text-align: center;">
         <video id="livePreview" width="360" height="240" autoplay muted style="border-radius: 8px; background: #000;"></video><br><br>
@@ -211,7 +251,6 @@ else:
     """
     st.components.v1.html(camera_html, height=360)
     
-    # Secondary uploader for the captured camera clip
     captured_upload = st.file_uploader("Upload Your Recorded Camera Clip", type=["mp4", "webm"], key="cam_upload")
     if captured_upload is not None:
         video_bytes = captured_upload.read()
